@@ -1,0 +1,35 @@
+# Development Docker Compose configuration
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+#
+# Mounts the local ./bot directory and persists cargo cache/target directories,
+# giving instant incremental reloads without rebuilding images!
+
+services:
+  bot:
+    image: discord_ai-bot:dev
+    build:
+      context: ./bot
+      dockerfile: Dockerfile.dev
+    container_name: discord_ai_bot_dev
+    volumes:
+      # Live code mounting
+      - ./bot:/app
+      # Cached build artifacts and crates so rebuilds take seconds
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+      - bot_target:/app/target
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-discord_ai}
+      - RUST_LOG=${RUST_LOG:-info}
+    ports:
+      - "${INSTAGRAM_WEBHOOK_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  cargo_registry:
+  cargo_git:
+  bot_target:

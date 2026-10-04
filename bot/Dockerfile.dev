@@ -1,0 +1,27 @@
+FROM rust:1-bookworm
+
+WORKDIR /app
+
+# Install build dependencies, tools, ffmpeg, and python3
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    curl \
+    xz-utils \
+    ffmpeg \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install yt-dlp binary
+RUN curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp
+
+# Download precompiled cargo-watch binary instantly (instead of compiling for 4 minutes)
+RUN curl -fsSL https://github.com/watchexec/cargo-watch/releases/download/v8.5.3/cargo-watch-v8.5.3-x86_64-unknown-linux-musl.tar.xz \
+    | tar -xJ --strip-components=1 -C /usr/local/cargo/bin cargo-watch-v8.5.3-x86_64-unknown-linux-musl/cargo-watch
+
+ENV RUST_LOG=info
+
+# Automatically watch src and recompile incrementally on file save
+CMD ["cargo", "watch", "-w", "src", "-x", "run"]
