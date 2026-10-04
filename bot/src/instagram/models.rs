@@ -10,14 +10,14 @@ pub struct MetaVerificationQuery {
     pub challenge: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct MetaWebhookPayload {
     pub object: Option<String>,
     #[serde(default)]
     pub entry: Vec<MetaEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct MetaEntry {
     pub id: Option<String>,
     pub time: Option<i64>,
@@ -25,37 +25,48 @@ pub struct MetaEntry {
     pub messaging: Vec<MetaMessagingEvent>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct MetaMessagingEvent {
     pub sender: Option<MetaEntity>,
     pub recipient: Option<MetaEntity>,
     pub timestamp: Option<i64>,
     pub message: Option<MetaMessage>,
+    pub share: Option<MetaShare>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct MetaEntity {
     pub id: Option<String>,
+    pub username: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct MetaMessage {
     pub mid: Option<String>,
     pub text: Option<String>,
     #[serde(default)]
     pub attachments: Vec<MetaAttachment>,
+    pub share: Option<MetaShare>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct MetaAttachment {
     #[serde(rename = "type")]
     pub attachment_type: Option<String>,
     pub payload: Option<MetaAttachmentPayload>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct MetaAttachmentPayload {
     pub url: Option<String>,
+    pub title: Option<String>,
+    pub ig_post_media_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct MetaShare {
+    pub link: Option<String>,
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,11 +79,12 @@ pub enum InstagramMediaKind {
 
 impl InstagramMediaKind {
     pub fn from_url(url: &str) -> Self {
-        if url.contains("/reel/") || url.contains("/reels/") {
+        let lower = url.to_lowercase();
+        if lower.contains("/reel/") || lower.contains("/reels/") {
             Self::Reel
-        } else if url.contains("/collection") || url.contains("/collections/") {
+        } else if lower.contains("/collection") || lower.contains("/collections/") {
             Self::Collection
-        } else if url.contains("/p/") {
+        } else if lower.contains("/p/") {
             Self::Post
         } else {
             Self::Generic
@@ -106,9 +118,18 @@ pub struct ExtractedMedia {
     pub media_kind: InstagramMediaKind,
 }
 
+#[derive(Debug, Clone)]
+pub enum InboundInstagramEvent {
+    Media(ExtractedMedia),
+    Text {
+        sender_id: String,
+        text: String,
+    },
+}
+
 impl MetaWebhookPayload {
-    /// Extracts all Instagram media (reels, posts, collections) and optional accompanying text.
-    pub fn extract_media(&self) -> Vec<ExtractedMedia> {
+    /// Extracts all Instagram media (reels, posts, collections) or text messages.
+    pub fn extract_events(&self) -> Vec<InboundInstagramEvent> {
         let mut results = Vec::new();
 
         for entry in &self.entry {
@@ -119,17 +140,18 @@ impl MetaWebhookPayload {
                     .and_then(|s| s.id.clone())
                     .unwrap_or_else(|| "Unknown".to_string());
 
-                if let Some(ref msg) = messaging.message {
-                    let mut found_url: Option<String> = None;
-                    let mut user_comment: Option<String> = None;
+                let mut found_url: Option<String> = None;
+                let mut user_comment: Option<String> = None;
 
+                if let Some(ref msg) = messaging.message {
                     // 1. Check message text for any Instagram URL
                     if let Some(ref text) = msg.text {
                         for part in text.split_whitespace() {
-                            let clean = part.trim_matches(|c| c == '<' || c == '>' || c == '"' || c == '\'');
+                            let clean = part.trim_matches(|c| {
+                                c == '<' || c == '>' || c == '"' || c == '\'' || c == '(' || c == ')'
+                            });
                             if is_instagram_url(clean) {
                                 found_url = Some(clean.to_string());
-                                // Extract the rest of the text as the user's caption/comment
                                 let remaining = text.replace(clean, "");
                                 let trimmed = remaining.trim();
                                 if !trimmed.is_empty() {
@@ -147,16 +169,21 @@ impl MetaWebhookPayload {
                             if let Some(ref payload) = attachment.payload {
                                 if let Some(ref url) = payload.url {
                                     if is_instagram_url(url)
-                                        || att_type == "ig_reel"
                                         || att_type == "share"
+                                        || att_type == "ig_reel"
+                                        || att_type == "ig_post"
+                                        || att_type == "reel"
                                         || att_type == "carousel"
+                                        || att_type == "video"
+                                        || att_type == "image"
                                     {
                                         found_url = Some(url.clone());
-                                        // When shared via Instagram DM share button, msg.text holds the user's comment
-                                        if let Some(ref text) = msg.text {
-                                            let trimmed = text.trim();
-                                            if !trimmed.is_empty() {
-                                                user_comment = Some(trimmed.to_string());
+                                        if user_comment.is_none() {
+                                            if let Some(ref text) = msg.text {
+                                                let trimmed = text.trim();
+                                                if !trimmed.is_empty() {
+                                                    user_comment = Some(trimmed.to_string());
+                                                }
                                             }
                                         }
                                         break;
@@ -164,24 +191,40 @@ impl MetaWebhookPayload {
                                 }
                             }
                         }
-                    } else if user_comment.is_none() {
-                        // In case text has extra comment
-                        if let Some(ref text) = msg.text {
-                            let trimmed = text.trim();
-                            if !trimmed.is_empty() && found_url.as_deref() != Some(trimmed) {
-                                user_comment = Some(trimmed.to_string());
+                    }
+
+                    // 3. Check message.share or messaging.share
+                    if found_url.is_none() {
+                        if let Some(ref share) = msg.share {
+                            if let Some(ref link) = share.link {
+                                found_url = Some(link.clone());
+                            }
+                        }
+                    }
+                    if found_url.is_none() {
+                        if let Some(ref share) = messaging.share {
+                            if let Some(ref link) = share.link {
+                                found_url = Some(link.clone());
                             }
                         }
                     }
 
                     if let Some(media_url) = found_url {
                         let media_kind = InstagramMediaKind::from_url(&media_url);
-                        results.push(ExtractedMedia {
+                        results.push(InboundInstagramEvent::Media(ExtractedMedia {
                             sender_id,
                             media_url,
                             user_text: user_comment,
                             media_kind,
-                        });
+                        }));
+                    } else if let Some(ref text) = msg.text {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            results.push(InboundInstagramEvent::Text {
+                                sender_id,
+                                text: trimmed.to_string(),
+                            });
+                        }
                     }
                 }
             }
@@ -189,16 +232,29 @@ impl MetaWebhookPayload {
 
         results
     }
+
+    /// Backwards compatibility helper for media-only extraction.
+    pub fn extract_media(&self) -> Vec<ExtractedMedia> {
+        self.extract_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                InboundInstagramEvent::Media(m) => Some(m),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// Checks whether a URL points to an Instagram reel, post, collection, or share.
-fn is_instagram_url(s: &str) -> bool {
-    (s.contains("instagram.com/") || s.contains("instagr.am/"))
-        && (s.contains("/reel/")
-            || s.contains("/reels/")
-            || s.contains("/p/")
-            || s.contains("/share/")
-            || s.contains("/collection/")
-            || s.contains("/collections/")
-            || s.contains("/tv/"))
+pub fn is_instagram_url(s: &str) -> bool {
+    let lower = s.to_lowercase();
+    (lower.contains("instagram.com/") || lower.contains("instagr.am/"))
+        && (lower.contains("/reel/")
+            || lower.contains("/reels/")
+            || lower.contains("/p/")
+            || lower.contains("/share/")
+            || lower.contains("/collection/")
+            || lower.contains("/collections/")
+            || lower.contains("/tv/")
+            || lower.contains("/stories/"))
 }

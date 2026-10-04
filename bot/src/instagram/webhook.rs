@@ -9,7 +9,9 @@ use tracing::{error, info, warn};
 
 use crate::db::Database;
 use crate::instagram::downloader::{self, MediaDownload};
-use crate::instagram::models::{ExtractedMedia, MetaVerificationQuery, MetaWebhookPayload};
+use crate::instagram::models::{
+    ExtractedMedia, InboundInstagramEvent, MetaVerificationQuery, MetaWebhookPayload,
+};
 
 #[derive(Clone)]
 pub struct WebhookState {
@@ -52,23 +54,102 @@ async fn verify_webhook(
 /// Meta Webhook Event ingestion handler (POST /webhook).
 async fn handle_webhook(
     State(state): State<WebhookState>,
-    Json(payload): Json<MetaWebhookPayload>,
+    Json(payload_value): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    info!(
+        raw_payload = %payload_value,
+        "Inbound Instagram webhook received"
+    );
+
+    let payload: MetaWebhookPayload = match serde_json::from_value(payload_value) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("Failed to deserialize Meta webhook payload: {e}");
+            return (StatusCode::OK, "EVENT_RECEIVED");
+        }
+    };
+
     if payload.object.as_deref() != Some("instagram") {
         return (StatusCode::NOT_FOUND, "Not an instagram object");
     }
 
-    let items = payload.extract_media();
-    info!("Received webhook with {} media item(s)", items.len());
+    let events = payload.extract_events();
+    info!("Extracted {} event(s) from webhook", events.len());
 
-    for item in items {
+    for event in events {
         let state_clone = state.clone();
         tokio::spawn(async move {
-            process_and_deliver_media(state_clone, item).await;
+            match event {
+                InboundInstagramEvent::Media(media) => {
+                    process_and_deliver_media(state_clone, media).await;
+                }
+                InboundInstagramEvent::Text { sender_id, text } => {
+                    process_and_deliver_text(state_clone, sender_id, text).await;
+                }
+            }
         });
     }
 
     (StatusCode::OK, "EVENT_RECEIVED")
+}
+
+/// Resolves user display name with mention formatting if mapped.
+async fn resolve_sender_display(state: &WebhookState, sender_id: &str) -> String {
+    match state.db.get_instagram_sender(sender_id).await {
+        Ok(Some(sender)) => {
+            if let Some(discord_id) = sender.discord_user_id {
+                format!("<@{discord_id}> (@{})", sender.username)
+            } else {
+                format!("@{}", sender.username)
+            }
+        }
+        _ => {
+            let last4 = if sender_id.len() >= 4 {
+                &sender_id[sender_id.len() - 4..]
+            } else {
+                sender_id
+            };
+            format!("User_{last4}")
+        }
+    }
+}
+
+/// Resolves the configured Discord target channel ID.
+async fn resolve_target_channel(state: &WebhookState) -> Option<serenity::ChannelId> {
+    let channel_id_u64 = match state.db.get_setting("instagram_target_channel_id").await {
+        Ok(Some(id_str)) => id_str.parse::<u64>().ok(),
+        _ => None,
+    }
+    .or(state.default_target_channel_id);
+
+    channel_id_u64.map(serenity::ChannelId::new)
+}
+
+/// Processes an inbound Instagram text message and posts it directly to Discord.
+async fn process_and_deliver_text(state: WebhookState, sender_id: String, text: String) {
+    info!(
+        sender_id = %sender_id,
+        text = %text,
+        "Delivering inbound Instagram text message"
+    );
+
+    let target_channel_id = match resolve_target_channel(&state).await {
+        Some(ch) => ch,
+        None => {
+            error!("Target channel ID not configured. Use /instagram channel set");
+            return;
+        }
+    };
+
+    let sender_display = resolve_sender_display(&state, &sender_id).await;
+    let content = format!("{sender_display}: {text}");
+
+    let msg = serenity::CreateMessage::new().content(content);
+    if let Err(e) = target_channel_id.send_message(&state.http, msg).await {
+        error!("Failed to post text message to Discord: {e}");
+    } else {
+        info!("Successfully delivered Instagram text message to Discord");
+    }
 }
 
 /// Processes an extracted Instagram media item (reel, post, or collection) and posts it to Discord.
@@ -81,52 +162,26 @@ async fn process_and_deliver_media(state: WebhookState, media: ExtractedMedia) {
         "Processing Instagram media for delivery"
     );
 
-    // 1. Resolve Target Channel ID
-    let channel_id_u64 = match state.db.get_setting("instagram_target_channel_id").await {
-        Ok(Some(id_str)) => id_str.parse::<u64>().ok(),
-        _ => None,
-    }
-    .or(state.default_target_channel_id);
-
-    let target_channel_id = match channel_id_u64 {
-        Some(id) => serenity::ChannelId::new(id),
+    let target_channel_id = match resolve_target_channel(&state).await {
+        Some(ch) => ch,
         None => {
-            error!(
-                "Target channel ID not configured. Use /instagram channel set or set INSTAGRAM_TARGET_CHANNEL_ID"
-            );
+            error!("Target channel ID not configured. Use /instagram channel set");
             return;
         }
     };
 
-    // 2. Resolve Sender Profile
-    let sender_display = match state.db.get_instagram_sender(&media.sender_id).await {
-        Ok(Some(sender)) => {
-            if let Some(discord_id) = sender.discord_user_id {
-                format!("<@{discord_id}> (@{})", sender.username)
-            } else {
-                format!("@{}", sender.username)
-            }
-        }
-        _ => {
-            let last4 = if media.sender_id.len() >= 4 {
-                &media.sender_id[media.sender_id.len() - 4..]
-            } else {
-                &media.sender_id
-            };
-            format!("User_{last4}")
-        }
-    };
+    let sender_display = resolve_sender_display(&state, &media.sender_id).await;
 
-    // Construct caption header
+    // Construct caption header: <@discord_id> (@username): text, or <@discord_id> (@username)
     let content_text = match &media.user_text {
         Some(caption) => format!("{sender_display}: {caption}"),
         None => sender_display,
     };
 
-    // 3. Download or Prepare Media
+    // Download or Prepare Media
     let download_result = downloader::download_media(&media.media_url).await;
 
-    // 4. Construct button
+    // Construct button
     let link_button = serenity::CreateButton::new_link(&media.media_url)
         .label(media.media_kind.button_label());
     let action_row = serenity::CreateActionRow::Buttons(vec![link_button]);
@@ -153,7 +208,7 @@ async fn process_and_deliver_media(state: WebhookState, media: ExtractedMedia) {
                     info!("Successfully uploaded media files to Discord");
                 }
             } else {
-                let fallback_url = downloader::to_ddinstagram_url(&media.media_url);
+                let fallback_url = downloader::to_fxinstagram_url(&media.media_url);
                 let msg = serenity::CreateMessage::new()
                     .content(format!("{content_text}\n{fallback_url}"))
                     .components(vec![action_row]);
