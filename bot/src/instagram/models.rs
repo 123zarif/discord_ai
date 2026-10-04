@@ -230,7 +230,33 @@ impl MetaWebhookPayload {
             }
         }
 
-        results
+        // Correlate: if a sender has both a text event and a media event without caption in the same payload,
+        // merge the text into the media event's caption so it posts as a single unified message.
+        let mut final_events = Vec::new();
+        let mut text_by_sender: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+        for event in results {
+            match event {
+                InboundInstagramEvent::Text { sender_id, text } => {
+                    text_by_sender.insert(sender_id, text);
+                }
+                InboundInstagramEvent::Media(mut media) => {
+                    if media.user_text.is_none() {
+                        if let Some(text) = text_by_sender.remove(&media.sender_id) {
+                            media.user_text = Some(text);
+                        }
+                    }
+                    final_events.push(InboundInstagramEvent::Media(media));
+                }
+            }
+        }
+
+        // Any remaining text events without accompanying media
+        for (sender_id, text) in text_by_sender {
+            final_events.push(InboundInstagramEvent::Text { sender_id, text });
+        }
+
+        final_events
     }
 
     /// Backwards compatibility helper for media-only extraction.

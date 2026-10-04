@@ -181,10 +181,13 @@ async fn process_and_deliver_media(state: WebhookState, media: ExtractedMedia) {
     // Download or Prepare Media
     let download_result = downloader::download_media(&media.media_url).await;
 
-    // Construct button
-    let link_button = serenity::CreateButton::new_link(&media.media_url)
-        .label(media.media_kind.button_label());
-    let action_row = serenity::CreateActionRow::Buttons(vec![link_button]);
+    // Construct button only if this is a genuine Instagram URL (not internal CDN)
+    let mut components = Vec::new();
+    if crate::instagram::models::is_instagram_url(&media.media_url) {
+        let link_button = serenity::CreateButton::new_link(&media.media_url)
+            .label(media.media_kind.button_label());
+        components.push(serenity::CreateActionRow::Buttons(vec![link_button]));
+    }
 
     match download_result {
         MediaDownload::DirectFiles { paths, .. } => {
@@ -197,35 +200,47 @@ async fn process_and_deliver_media(state: WebhookState, media: ExtractedMedia) {
             }
 
             if !attachments.is_empty() {
-                let msg = serenity::CreateMessage::new()
+                let mut msg = serenity::CreateMessage::new()
                     .content(content_text)
-                    .components(vec![action_row])
                     .files(attachments);
+
+                if !components.is_empty() {
+                    msg = msg.components(components.clone());
+                }
 
                 if let Err(e) = target_channel_id.send_message(&state.http, msg).await {
                     error!("Failed to send direct media files to Discord channel: {e}");
                 } else {
                     info!("Successfully uploaded media files to Discord");
                 }
-            } else {
+            } else if crate::instagram::models::is_instagram_url(&media.media_url) {
                 let fallback_url = downloader::to_fxinstagram_url(&media.media_url);
-                let msg = serenity::CreateMessage::new()
-                    .content(format!("{content_text}\n{fallback_url}"))
-                    .components(vec![action_row]);
+                let mut msg = serenity::CreateMessage::new()
+                    .content(format!("{content_text}\n{fallback_url}"));
+                if !components.is_empty() {
+                    msg = msg.components(components);
+                }
                 let _ = target_channel_id.send_message(&state.http, msg).await;
             }
 
             downloader::cleanup_files(&paths).await;
         }
         MediaDownload::TooLarge { fallback_url, .. } | MediaDownload::Failed { fallback_url, .. } => {
-            let msg = serenity::CreateMessage::new()
-                .content(format!("{content_text}\n{fallback_url}"))
-                .components(vec![action_row]);
+            if crate::instagram::models::is_instagram_url(&media.media_url) {
+                let mut msg = serenity::CreateMessage::new()
+                    .content(format!("{content_text}\n{fallback_url}"));
 
-            if let Err(e) = target_channel_id.send_message(&state.http, msg).await {
-                error!("Failed to post media link to Discord: {e}");
+                if !components.is_empty() {
+                    msg = msg.components(components);
+                }
+
+                if let Err(e) = target_channel_id.send_message(&state.http, msg).await {
+                    error!("Failed to post media link to Discord: {e}");
+                } else {
+                    info!("Posted media stream to Discord");
+                }
             } else {
-                info!("Posted media stream to Discord");
+                warn!("CDN media download was not usable, skipping link fallback");
             }
         }
     }

@@ -63,7 +63,24 @@ fn extract_meta_image(html: &str) -> Option<String> {
     None
 }
 
-/// Directly downloads a CDN asset (image or video) via HTTP.
+/// Inspects the header magic bytes of a file buffer to detect the actual format.
+fn detect_media_extension(bytes: &[u8]) -> &'static str {
+    if bytes.len() >= 3 && bytes[0..3] == [0xFF, 0xD8, 0xFF] {
+        "jpg"
+    } else if bytes.len() >= 8 && bytes[0..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
+        "png"
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "webp"
+    } else if bytes.len() >= 3 && &bytes[0..3] == b"GIF" {
+        "gif"
+    } else if bytes.len() >= 8 && (&bytes[4..8] == b"ftyp" || &bytes[4..8] == b"moov") {
+        "mp4"
+    } else {
+        "bin"
+    }
+}
+
+/// Directly downloads a CDN asset (image or video) via HTTP with magic byte validation.
 async fn download_direct_cdn(url: &str, file_prefix: &str) -> Option<PathBuf> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -75,20 +92,33 @@ async fn download_direct_cdn(url: &str, file_prefix: &str) -> Option<PathBuf> {
         return None;
     }
 
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() < 512 {
+        return None;
+    }
 
-    let ext = if content_type.contains("video") || url.contains(".mp4") {
-        "mp4"
+    let ext = detect_media_extension(&bytes);
+    if ext == "bin" {
+        warn!("Direct CDN asset has unrecognized media header");
+        return None;
+    }
+
+    let dir = format!("/tmp/{file_prefix}");
+    tokio::fs::create_dir_all(&dir).await.ok()?;
+
+    let filename = if ext == "mp4" {
+        "video.mp4"
     } else {
-        "jpg"
+        match ext {
+            "jpg" => "photo.jpg",
+            "png" => "photo.png",
+            "webp" => "photo.webp",
+            "gif" => "animation.gif",
+            _ => "media.bin",
+        }
     };
 
-    let target_path = PathBuf::from(format!("/tmp/{file_prefix}_cdn.{ext}"));
-    let bytes = resp.bytes().await.ok()?;
+    let target_path = PathBuf::from(format!("{dir}/{filename}"));
     tokio::fs::write(&target_path, &bytes).await.ok()?;
     Some(target_path)
 }
@@ -99,6 +129,8 @@ pub async fn download_media(media_url: &str) -> MediaDownload {
     let fallback_url = to_fxinstagram_url(media_url);
     let output_id = Uuid::new_v4();
     let file_prefix = format!("ig_{output_id}");
+    let dir = format!("/tmp/{file_prefix}");
+    let _ = tokio::fs::create_dir_all(&dir).await;
 
     // If this is a direct CDN asset link (e.g. from Meta's lookaside / cdn servers)
     if media_url.contains("fbsbx.com")
@@ -125,7 +157,7 @@ pub async fn download_media(media_url: &str) -> MediaDownload {
         }
     }
 
-    let output_template = format!("/tmp/{file_prefix}_%(autonumber)02d.%(ext)s");
+    let output_template = format!("{dir}/reel_%(autonumber)02d.%(ext)s");
     let cookies = find_cookies_path();
 
     info!(
@@ -155,18 +187,15 @@ pub async fn download_media(media_url: &str) -> MediaDownload {
         }
     };
 
-    // Scan /tmp for files matching our unique prefix
+    // Scan temporary directory for files
     let mut downloaded_files = Vec::new();
     let mut total_size_bytes = 0u64;
 
-    if let Ok(mut entries) = tokio::fs::read_dir("/tmp").await {
+    if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
-            let file_name = entry.file_name().to_string_lossy().to_string();
-            if file_name.starts_with(&file_prefix) {
-                if let Ok(meta) = entry.metadata().await {
-                    total_size_bytes += meta.len();
-                    downloaded_files.push(entry.path());
-                }
+            if let Ok(meta) = entry.metadata().await {
+                total_size_bytes += meta.len();
+                downloaded_files.push(entry.path());
             }
         }
     }
@@ -198,7 +227,7 @@ pub async fn download_media(media_url: &str) -> MediaDownload {
                                 Ok(img_resp) => {
                                     if img_resp.status().is_success() {
                                         if let Ok(bytes) = img_resp.bytes().await {
-                                            let photo_path = PathBuf::from(format!("/tmp/{file_prefix}_photo.jpg"));
+                                            let photo_path = PathBuf::from(format!("{dir}/photo.jpg"));
                                             if let Err(e) = tokio::fs::write(&photo_path, &bytes).await {
                                                 warn!("Failed to write photo to disk: {e}");
                                             } else {
@@ -254,11 +283,14 @@ pub async fn download_media(media_url: &str) -> MediaDownload {
     }
 }
 
-/// Safely removes temporary files if they still exist.
+/// Safely removes temporary files and folders if they still exist.
 pub async fn cleanup_files(paths: &[PathBuf]) {
     for p in paths {
         if p.exists() {
             let _ = tokio::fs::remove_file(p).await;
+            if let Some(parent) = p.parent() {
+                let _ = tokio::fs::remove_dir_all(parent).await;
+            }
         }
     }
 }
