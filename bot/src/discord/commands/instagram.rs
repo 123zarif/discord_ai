@@ -1,8 +1,7 @@
 use poise::serenity_prelude as serenity;
 use crate::discord::{Context, Error};
-use crate::instagram::webhook::{INSTAGRAM_ICON_URL, INSTAGRAM_MAGENTA};
 
-/// Manage Instagram reel webhook configuration, target channels, and sender links.
+/// Manage Instagram webhook configuration, target channels, and sender links.
 #[poise::command(
     slash_command,
     subcommands("channel", "link", "senders"),
@@ -12,7 +11,7 @@ pub async fn instagram(_ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Manage the target Discord channel where Instagram reels are posted.
+/// Manage the target Discord channel where Instagram media is posted.
 #[poise::command(
     slash_command,
     subcommands("channel_set", "channel_get"),
@@ -22,11 +21,11 @@ pub async fn channel(_ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Set the Discord channel where incoming Instagram reels should be posted.
+/// Set the Discord channel where incoming Instagram media should be posted.
 #[poise::command(slash_command, rename = "set")]
 pub async fn channel_set(
     ctx: Context<'_>,
-    #[description = "Channel where reels will be posted"]
+    #[description = "Channel where media will be posted"]
     target: serenity::Channel,
 ) -> Result<(), Error> {
     ctx.defer_ephemeral().await?;
@@ -36,20 +35,17 @@ pub async fn channel_set(
 
     db.set_setting("instagram_target_channel_id", &channel_id_str).await?;
 
-    let embed = serenity::CreateEmbed::new()
-        .author(serenity::CreateEmbedAuthor::new("Instagram Integration").icon_url(INSTAGRAM_ICON_URL))
-        .title("Target Channel Updated")
-        .description(format!(
-            "✅ Incoming Instagram reels will now be posted to <#{}>!",
-            target.id()
-        ))
-        .color(INSTAGRAM_MAGENTA);
+    ctx.send(
+        poise::CreateReply::default()
+            .content(format!("Target channel set to <#{}>.", target.id()))
+            .ephemeral(true),
+    )
+    .await?;
 
-    ctx.send(poise::CreateReply::default().embed(embed).ephemeral(true)).await?;
     Ok(())
 }
 
-/// View the currently configured channel for Instagram reels.
+/// View the currently configured channel for Instagram media.
 #[poise::command(slash_command, rename = "get")]
 pub async fn channel_get(ctx: Context<'_>) -> Result<(), Error> {
     ctx.defer_ephemeral().await?;
@@ -61,19 +57,19 @@ pub async fn channel_get(ctx: Context<'_>) -> Result<(), Error> {
         .or_else(|_| std::env::var("TARGET_CHANNEL_ID"))
         .ok();
 
-    let desc = match (setting, env_fallback) {
-        (Some(id), _) => format!("Active Target Channel: <#{id}> (Configured in Database)"),
-        (None, Some(id)) => format!("Active Target Channel: <#{id}> (Configured in .env)"),
-        (None, None) => "⚠️ No target channel configured yet. Use `/instagram channel set #channel` or set `INSTAGRAM_TARGET_CHANNEL_ID` in `.env`.".to_string(),
+    let text = match (setting, env_fallback) {
+        (Some(id), _) => format!("Target channel: <#{id}> (database)"),
+        (None, Some(id)) => format!("Target channel: <#{id}> (.env)"),
+        (None, None) => "No target channel configured. Set one with `/instagram channel set #channel`.".to_string(),
     };
 
-    let embed = serenity::CreateEmbed::new()
-        .author(serenity::CreateEmbedAuthor::new("Instagram Integration").icon_url(INSTAGRAM_ICON_URL))
-        .title("Instagram Reel Destination")
-        .description(desc)
-        .color(INSTAGRAM_MAGENTA);
+    ctx.send(
+        poise::CreateReply::default()
+            .content(text)
+            .ephemeral(true),
+    )
+    .await?;
 
-    ctx.send(poise::CreateReply::default().embed(embed).ephemeral(true)).await?;
     Ok(())
 }
 
@@ -85,7 +81,7 @@ pub async fn link(
     sender_id: String,
     #[description = "Instagram username without @ (e.g. Zarif_1020)"]
     username: String,
-    #[description = "Optional Discord user to tag when this sender shares a reel"]
+    #[description = "Optional Discord user to tag when this sender shares media"]
     discord_user: Option<serenity::User>,
 ) -> Result<(), Error> {
     ctx.defer().await?;
@@ -97,20 +93,12 @@ pub async fn link(
     let db = &ctx.data().db;
     db.upsert_instagram_sender(clean_sender_id, clean_username, discord_id).await?;
 
-    let mut desc = format!(
-        "Linked sender ID `{clean_sender_id}` to **@{clean_username}**!"
-    );
+    let mut response = format!("Linked `{clean_sender_id}` to **@{clean_username}**.");
     if let Some(user) = discord_user {
-        desc.push_str(&format!("\n• Linked Discord Profile: <@{}>", user.id));
+        response.push_str(&format!(" Discord account: <@{}>", user.id));
     }
 
-    let embed = serenity::CreateEmbed::new()
-        .author(serenity::CreateEmbedAuthor::new("Instagram Integration").icon_url(INSTAGRAM_ICON_URL))
-        .title("Sender Profile Linked")
-        .description(desc)
-        .color(INSTAGRAM_MAGENTA);
-
-    ctx.send(poise::CreateReply::default().embed(embed)).await?;
+    ctx.send(poise::CreateReply::default().content(response)).await?;
     Ok(())
 }
 
@@ -125,7 +113,7 @@ pub async fn senders(ctx: Context<'_>) -> Result<(), Error> {
     if list.is_empty() {
         ctx.send(
             poise::CreateReply::default()
-                .content("No Instagram senders mapped yet. Use `/instagram link <sender_id> <username>`!")
+                .content("No senders mapped yet. Use `/instagram link <sender_id> <username>`.")
                 .ephemeral(true),
         )
         .await?;
@@ -136,7 +124,7 @@ pub async fn senders(ctx: Context<'_>) -> Result<(), Error> {
     for (i, sender) in list.iter().enumerate() {
         let discord_str = sender
             .discord_user_id
-            .map(|id| format!(" ➔ <@{id}>"))
+            .map(|id| format!(" -> <@{id}>"))
             .unwrap_or_default();
         desc.push_str(&format!(
             "`{:2}.` **@{}** (`{}`){}\n",
@@ -148,13 +136,9 @@ pub async fn senders(ctx: Context<'_>) -> Result<(), Error> {
     }
 
     let embed = serenity::CreateEmbed::new()
-        .author(serenity::CreateEmbedAuthor::new("Instagram Integration").icon_url(INSTAGRAM_ICON_URL))
-        .title(format!("Registered Instagram Senders ({})", list.len()))
+        .title(format!("Registered Senders ({})", list.len()))
         .description(desc)
-        .color(INSTAGRAM_MAGENTA)
-        .footer(serenity::CreateEmbedFooter::new(
-            "Use /instagram link to map new sender IDs",
-        ));
+        .color(0x5865F2);
 
     ctx.send(poise::CreateReply::default().embed(embed)).await?;
     Ok(())

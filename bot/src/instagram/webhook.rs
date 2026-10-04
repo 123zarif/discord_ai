@@ -8,12 +8,8 @@ use poise::serenity_prelude as serenity;
 use tracing::{error, info, warn};
 
 use crate::db::Database;
-use crate::instagram::downloader::{self, ReelDownload};
-use crate::instagram::models::{ExtractedReel, MetaVerificationQuery, MetaWebhookPayload};
-
-pub const INSTAGRAM_MAGENTA: u32 = 0xE1306C;
-pub const INSTAGRAM_ICON_URL: &str =
-    "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a5/Instagram_icon.png/600px-Instagram_icon.png";
+use crate::instagram::downloader::{self, MediaDownload};
+use crate::instagram::models::{ExtractedMedia, MetaVerificationQuery, MetaWebhookPayload};
 
 #[derive(Clone)]
 pub struct WebhookState {
@@ -40,14 +36,14 @@ async fn verify_webhook(
     let token = query.verify_token.as_deref().unwrap_or_default();
 
     if mode == "subscribe" && token == state.verify_token {
-        info!("Meta Webhook successfully verified and linked!");
+        info!("Meta Webhook verified successfully");
         let challenge = query.challenge.unwrap_or_default();
         (StatusCode::OK, challenge)
     } else {
         warn!(
             mode,
             received_token = token,
-            "Meta Webhook verification failed: token mismatch or invalid mode"
+            "Meta Webhook verification failed: token mismatch"
         );
         (StatusCode::FORBIDDEN, "Forbidden".to_string())
     }
@@ -62,25 +58,27 @@ async fn handle_webhook(
         return (StatusCode::NOT_FOUND, "Not an instagram object");
     }
 
-    let reels = payload.extract_reels();
-    info!("Received webhook with {} reel event(s)", reels.len());
+    let items = payload.extract_media();
+    info!("Received webhook with {} media item(s)", items.len());
 
-    for reel in reels {
+    for item in items {
         let state_clone = state.clone();
         tokio::spawn(async move {
-            process_and_deliver_reel(state_clone, reel).await;
+            process_and_deliver_media(state_clone, item).await;
         });
     }
 
     (StatusCode::OK, "EVENT_RECEIVED")
 }
 
-/// Processes an extracted Instagram reel and posts it to Discord.
-async fn process_and_deliver_reel(state: WebhookState, reel: ExtractedReel) {
+/// Processes an extracted Instagram media item (reel, post, or collection) and posts it to Discord.
+async fn process_and_deliver_media(state: WebhookState, media: ExtractedMedia) {
     info!(
-        sender_id = %reel.sender_id,
-        reel_url = %reel.reel_url,
-        "Processing inbound Instagram reel for Discord delivery"
+        sender_id = %media.sender_id,
+        media_url = %media.media_url,
+        kind = ?media.media_kind,
+        has_caption = media.user_text.is_some(),
+        "Processing Instagram media for delivery"
     );
 
     // 1. Resolve Target Channel ID
@@ -94,141 +92,85 @@ async fn process_and_deliver_reel(state: WebhookState, reel: ExtractedReel) {
         Some(id) => serenity::ChannelId::new(id),
         None => {
             error!(
-                "Cannot deliver Instagram reel: target channel ID not configured. \
-                Use /instagram channel set or configure INSTAGRAM_TARGET_CHANNEL_ID in .env"
+                "Target channel ID not configured. Use /instagram channel set or set INSTAGRAM_TARGET_CHANNEL_ID"
             );
             return;
         }
     };
 
     // 2. Resolve Sender Profile
-    let (sender_name, discord_tag) = match state.db.get_instagram_sender(&reel.sender_id).await {
+    let sender_display = match state.db.get_instagram_sender(&media.sender_id).await {
         Ok(Some(sender)) => {
-            let name = format!("@{}", sender.username);
-            let tag = sender.discord_user_id.map(|id| format!(" (<@{id}>)"));
-            (name, tag)
+            if let Some(discord_id) = sender.discord_user_id {
+                format!("<@{discord_id}> (@{})", sender.username)
+            } else {
+                format!("@{}", sender.username)
+            }
         }
         _ => {
-            let last4 = if reel.sender_id.len() >= 4 {
-                &reel.sender_id[reel.sender_id.len() - 4..]
+            let last4 = if media.sender_id.len() >= 4 {
+                &media.sender_id[media.sender_id.len() - 4..]
             } else {
-                &reel.sender_id
+                &media.sender_id
             };
-            (format!("User_{last4}"), None)
+            format!("User_{last4}")
         }
     };
 
-    // 3. Download or Prepare Media
-    let download_result = downloader::download_reel(&reel.reel_url).await;
+    // Construct caption header
+    let content_text = match &media.user_text {
+        Some(caption) => format!("{sender_display}: {caption}"),
+        None => sender_display,
+    };
 
-    // 4. Construct Modern Discord Message & Embed
-    let link_button = serenity::CreateButton::new_link(&reel.reel_url).label("Watch on Instagram");
+    // 3. Download or Prepare Media
+    let download_result = downloader::download_media(&media.media_url).await;
+
+    // 4. Construct button
+    let link_button = serenity::CreateButton::new_link(&media.media_url)
+        .label(media.media_kind.button_label());
     let action_row = serenity::CreateActionRow::Buttons(vec![link_button]);
 
-    let author_text = format!("Reel from {sender_name}");
-    let mention_part = discord_tag.unwrap_or_default();
-
     match download_result {
-        ReelDownload::DirectFile { path, size_mb } => {
-            let embed = serenity::CreateEmbed::new()
-                .author(
-                    serenity::CreateEmbedAuthor::new(author_text)
-                        .icon_url(INSTAGRAM_ICON_URL)
-                        .url(&reel.reel_url),
-                )
-                .title("New Instagram Reel")
-                .url(&reel.reel_url)
-                .description(format!("Shared by **{sender_name}**{mention_part}"))
-                .color(INSTAGRAM_MAGENTA)
-                .footer(serenity::CreateEmbedFooter::new(format!(
-                    "Direct Upload • {size_mb:.1} MB"
-                )));
-
-            match serenity::CreateAttachment::path(&path).await {
-                Ok(attachment) => {
-                    let msg = serenity::CreateMessage::new()
-                        .embed(embed)
-                        .components(vec![action_row])
-                        .files(vec![attachment]);
-
-                    if let Err(e) = target_channel_id.send_message(&state.http, msg).await {
-                        error!("Failed to send direct reel video to Discord channel: {e}");
-                    } else {
-                        info!("Successfully uploaded reel video file to Discord!");
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to create attachment from reel file: {e}");
-                    // Fallback to proxy link
-                    let fallback_url = downloader::to_ddinstagram_url(&reel.reel_url);
-                    let fallback_msg = serenity::CreateMessage::new()
-                        .content(format!("**New Reel from {sender_name}:**\n{fallback_url}"))
-                        .components(vec![action_row]);
-                    let _ = target_channel_id.send_message(&state.http, fallback_msg).await;
+        MediaDownload::DirectFiles { paths, .. } => {
+            let mut attachments = Vec::new();
+            for path in &paths {
+                match serenity::CreateAttachment::path(path).await {
+                    Ok(att) => attachments.push(att),
+                    Err(e) => warn!("Failed to load attachment from {:?}: {e}", path),
                 }
             }
 
-            downloader::cleanup_file(&path).await;
-        }
-        ReelDownload::TooLarge {
-            size_mb,
-            fallback_url,
-        } => {
-            let embed = serenity::CreateEmbed::new()
-                .author(
-                    serenity::CreateEmbedAuthor::new(author_text)
-                        .icon_url(INSTAGRAM_ICON_URL)
-                        .url(&reel.reel_url),
-                )
-                .title("New Instagram Reel")
-                .url(&reel.reel_url)
-                .description(format!(
-                    "Shared by **{sender_name}**{mention_part}\n\n*Video exceeds 25MB limit ({size_mb:.1} MB). Streaming via inline proxy:*",
-                ))
-                .color(INSTAGRAM_MAGENTA)
-                .footer(serenity::CreateEmbedFooter::new(format!(
-                    "Proxy Player • {size_mb:.1} MB"
-                )));
+            if !attachments.is_empty() {
+                let msg = serenity::CreateMessage::new()
+                    .content(content_text)
+                    .components(vec![action_row])
+                    .files(attachments);
 
-            let msg = serenity::CreateMessage::new()
-                .content(fallback_url)
-                .embed(embed)
-                .components(vec![action_row]);
-
-            if let Err(e) = target_channel_id.send_message(&state.http, msg).await {
-                error!("Failed to post proxy reel link to Discord: {e}");
+                if let Err(e) = target_channel_id.send_message(&state.http, msg).await {
+                    error!("Failed to send direct media files to Discord channel: {e}");
+                } else {
+                    info!("Successfully uploaded media files to Discord");
+                }
             } else {
-                info!("Posted proxy-embedded reel to Discord!");
+                let fallback_url = downloader::to_ddinstagram_url(&media.media_url);
+                let msg = serenity::CreateMessage::new()
+                    .content(format!("{content_text}\n{fallback_url}"))
+                    .components(vec![action_row]);
+                let _ = target_channel_id.send_message(&state.http, msg).await;
             }
-        }
-        ReelDownload::Failed {
-            reason,
-            fallback_url,
-        } => {
-            warn!(reason, "Reel download failed; using proxy fallback");
-            let embed = serenity::CreateEmbed::new()
-                .author(
-                    serenity::CreateEmbedAuthor::new(author_text)
-                        .icon_url(INSTAGRAM_ICON_URL)
-                        .url(&reel.reel_url),
-                )
-                .title("New Instagram Reel")
-                .url(&reel.reel_url)
-                .description(format!(
-                    "Shared by **{sender_name}**{mention_part}\n\n*Stream preview:*",
-                ))
-                .color(INSTAGRAM_MAGENTA)
-                .footer(serenity::CreateEmbedFooter::new("Proxy Stream Preview"));
 
+            downloader::cleanup_files(&paths).await;
+        }
+        MediaDownload::TooLarge { fallback_url, .. } | MediaDownload::Failed { fallback_url, .. } => {
             let msg = serenity::CreateMessage::new()
-                .content(fallback_url)
-                .embed(embed)
+                .content(format!("{content_text}\n{fallback_url}"))
                 .components(vec![action_row]);
 
             if let Err(e) = target_channel_id.send_message(&state.http, msg).await {
-                error!("Failed to post fallback reel to Discord: {e}");
+                error!("Failed to post media link to Discord: {e}");
             } else {
-                info!("Posted fallback reel stream to Discord!");
+                info!("Posted media stream to Discord");
             }
         }
     }
@@ -241,7 +183,7 @@ pub async fn start_webhook_server(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = create_webhook_router(state);
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    info!("🚀 Webhook gateway listening on http://0.0.0.0:{port}/webhook");
+    info!("Webhook gateway listening on http://0.0.0.0:{port}/webhook");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

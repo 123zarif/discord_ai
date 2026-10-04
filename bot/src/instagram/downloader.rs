@@ -1,14 +1,14 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-pub enum ReelDownload {
-    DirectFile {
-        path: PathBuf,
-        size_mb: f64,
+pub enum MediaDownload {
+    DirectFiles {
+        paths: Vec<PathBuf>,
+        total_size_mb: f64,
     },
     TooLarge {
-        size_mb: f64,
+        total_size_mb: f64,
         fallback_url: String,
     },
     Failed {
@@ -17,7 +17,7 @@ pub enum ReelDownload {
     },
 }
 
-/// Converts a regular Instagram reel URL to a ddinstagram proxy URL that embeds in Discord natively.
+/// Converts a regular Instagram URL to a ddinstagram proxy URL that embeds in Discord natively.
 pub fn to_ddinstagram_url(url: &str) -> String {
     if url.contains("instagram.com") {
         url.replace("instagram.com", "ddinstagram.com")
@@ -42,18 +42,19 @@ pub fn find_cookies_path() -> Option<PathBuf> {
     None
 }
 
-/// Downloads an Instagram reel using yt-dlp.
-pub async fn download_reel(reel_url: &str) -> ReelDownload {
-    let fallback_url = to_ddinstagram_url(reel_url);
+/// Downloads Instagram media (reel, post, or collection) using yt-dlp.
+pub async fn download_media(media_url: &str) -> MediaDownload {
+    let fallback_url = to_ddinstagram_url(media_url);
     let output_id = Uuid::new_v4();
-    let output_path = PathBuf::from(format!("/tmp/reel_{output_id}.mp4"));
+    let file_prefix = format!("ig_{output_id}");
+    let output_template = format!("/tmp/{file_prefix}_%(autonumber)02d.%(ext)s");
 
     let cookies = find_cookies_path();
 
     info!(
-        reel_url,
+        media_url,
         has_cookies = cookies.is_some(),
-        "Downloading Instagram reel with yt-dlp..."
+        "Downloading Instagram media with yt-dlp..."
     );
 
     let mut cmd = tokio::process::Command::new("yt-dlp");
@@ -62,72 +63,74 @@ pub async fn download_reel(reel_url: &str) -> ReelDownload {
         cmd.arg("--cookies").arg(cookie_path);
     }
 
-    cmd.arg("-o").arg(&output_path);
-    cmd.arg("--no-playlist");
-    cmd.arg(reel_url);
+    cmd.arg("-o").arg(&output_template);
+    cmd.arg("--max-downloads").arg("10");
+    cmd.arg(media_url);
 
     let output = match cmd.output().await {
         Ok(out) => out,
         Err(e) => {
             warn!("Failed to execute yt-dlp command: {e}");
-            return ReelDownload::Failed {
+            return MediaDownload::Failed {
                 reason: format!("yt-dlp execution error: {e}"),
                 fallback_url,
             };
         }
     };
 
-    if !output.status.success() {
+    // Scan /tmp for files matching our unique prefix
+    let mut downloaded_files = Vec::new();
+    let mut total_size_bytes = 0u64;
+
+    if let Ok(mut entries) = tokio::fs::read_dir("/tmp").await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with(&file_prefix) {
+                if let Ok(meta) = entry.metadata().await {
+                    total_size_bytes += meta.len();
+                    downloaded_files.push(entry.path());
+                }
+            }
+        }
+    }
+
+    downloaded_files.sort();
+
+    if downloaded_files.is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("yt-dlp failed downloading reel: {stderr}");
-        return ReelDownload::Failed {
+        warn!("yt-dlp produced no files for media: {stderr}");
+        return MediaDownload::Failed {
             reason: stderr.chars().take(200).collect(),
             fallback_url,
         };
     }
 
-    if !output_path.exists() {
-        warn!("yt-dlp completed with success but output file does not exist");
-        return ReelDownload::Failed {
-            reason: "Download completed but file is missing".to_string(),
+    let total_size_mb = total_size_bytes as f64 / (1024.0 * 1024.0);
+
+    // Check Discord file limit (25MB total per message)
+    if total_size_bytes > 20 * 1024 * 1024 {
+        warn!(
+            total_size_mb,
+            "Downloaded media exceeds 20MB Discord limit, falling back to proxy embed"
+        );
+        cleanup_files(&downloaded_files).await;
+        return MediaDownload::TooLarge {
+            total_size_mb,
             fallback_url,
         };
     }
 
-    // Check file size (Discord upload limit is 25MB for non-boosted bots)
-    let metadata = match tokio::fs::metadata(&output_path).await {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("Could not read downloaded file metadata: {e}");
-            let _ = tokio::fs::remove_file(&output_path).await;
-            return ReelDownload::Failed {
-                reason: "Could not read file size".to_string(),
-                fallback_url,
-            };
-        }
-    };
-
-    let size_bytes = metadata.len();
-    let size_mb = size_bytes as f64 / (1024.0 * 1024.0);
-
-    if size_bytes > 25 * 1024 * 1024 {
-        warn!(size_mb, "Reel exceeds 25MB Discord limit, falling back to proxy embed");
-        let _ = tokio::fs::remove_file(&output_path).await;
-        return ReelDownload::TooLarge {
-            size_mb,
-            fallback_url,
-        };
-    }
-
-    ReelDownload::DirectFile {
-        path: output_path,
-        size_mb,
+    MediaDownload::DirectFiles {
+        paths: downloaded_files,
+        total_size_mb,
     }
 }
 
-/// Safely removes temporary file if it still exists.
-pub async fn cleanup_file(path: &Path) {
-    if path.exists() {
-        let _ = tokio::fs::remove_file(path).await;
+/// Safely removes temporary files if they still exist.
+pub async fn cleanup_files(paths: &[PathBuf]) {
+    for p in paths {
+        if p.exists() {
+            let _ = tokio::fs::remove_file(p).await;
+        }
     }
 }
