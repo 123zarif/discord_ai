@@ -30,14 +30,25 @@ impl Config {
             .into());
         }
 
-        let mut database_url = std::env::var("DATABASE_URL")
-            .map_err(|_| ConfigError::MissingVariable("DATABASE_URL".to_string()))?;
-        if database_url.trim().is_empty() {
-            return Err(ConfigError::InvalidValue {
-                name: "DATABASE_URL".to_string(),
-                reason: "Database URL cannot be empty".to_string(),
+        let mut database_url = match std::env::var("DATABASE_URL") {
+            Ok(url) if !url.trim().is_empty() => url,
+            _ => {
+                let user = std::env::var("POSTGRES_USER").unwrap_or_else(|_| "postgres".to_string());
+                let password = std::env::var("POSTGRES_PASSWORD").unwrap_or_else(|_| "postgres".to_string());
+                let db = std::env::var("POSTGRES_DB").unwrap_or_else(|_| "discord_ai".to_string());
+                format!("postgresql://{user}:{password}@postgres:5432/{db}")
             }
-            .into());
+        };
+
+        // If DATABASE_URL contains unresolved env var placeholders like ${POSTGRES_USER}
+        if database_url.contains("${") {
+            let user = std::env::var("POSTGRES_USER").unwrap_or_else(|_| "postgres".to_string());
+            let password = std::env::var("POSTGRES_PASSWORD").unwrap_or_else(|_| "postgres".to_string());
+            let db = std::env::var("POSTGRES_DB").unwrap_or_else(|_| "discord_ai".to_string());
+            database_url = database_url
+                .replace("${POSTGRES_USER}", &user)
+                .replace("${POSTGRES_PASSWORD}", &password)
+                .replace("${POSTGRES_DB}", &db);
         }
 
         // Automatic local development fallback:
@@ -137,6 +148,9 @@ impl fmt::Debug for Config {
             .field("target_user_id", &self.target_user_id)
             .field("dev_guild_id", &self.dev_guild_id)
             .field("rust_log", &self.rust_log)
+            .field("instagram_verify_token", &"[REDACTED]")
+            .field("instagram_webhook_port", &self.instagram_webhook_port)
+            .field("instagram_target_channel_id", &self.instagram_target_channel_id)
             .finish()
     }
 }
@@ -154,15 +168,21 @@ mod tests {
             target_user_id: UserId::new(444555666),
             dev_guild_id: Some(GuildId::new(777888999)),
             rust_log: "info".to_string(),
+            instagram_verify_token: "super_secret_verify_token".to_string(),
+            instagram_webhook_port: 3000,
+            instagram_target_channel_id: Some(12345),
         };
 
         let debug_str = format!("{config:?}");
         assert!(!debug_str.contains("super_secret_discord_token"));
         assert!(!debug_str.contains("postgresql://user:pass"));
+        assert!(!debug_str.contains("super_secret_verify_token"));
         assert!(debug_str.contains("[REDACTED]"));
         assert!(debug_str.contains("111222333"));
         assert!(debug_str.contains("444555666"));
         assert!(debug_str.contains("777888999"));
+        assert!(debug_str.contains("3000"));
+        assert!(debug_str.contains("12345"));
     }
 
     #[test]
@@ -174,6 +194,9 @@ mod tests {
             target_user_id: UserId::new(200),
             dev_guild_id: None,
             rust_log: "info".to_string(),
+            instagram_verify_token: "dummy".to_string(),
+            instagram_webhook_port: 3000,
+            instagram_target_channel_id: None,
         };
 
         assert!(config.is_owner(UserId::new(100)));

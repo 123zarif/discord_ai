@@ -20,6 +20,10 @@ services:
       - cargo_git:/usr/local/cargo/git
       - bot_target:/app/target
     environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-discord_ai}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
       - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-discord_ai}
       - RUST_LOG=${RUST_LOG:-info}
     ports:
