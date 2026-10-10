@@ -1,7 +1,9 @@
 pub mod anilist;
+pub mod cinemeta;
 mod config;
 mod db;
 mod discord;
+pub mod embeddings;
 mod error;
 pub mod instagram;
 
@@ -11,6 +13,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use crate::config::Config;
 use crate::db::Database;
+use crate::embeddings::EmbeddingEngine;
 use crate::error::{DbError, Result};
 
 #[tokio::main]
@@ -53,8 +56,14 @@ async fn run_app() -> Result<()> {
     db.init_tables().await?;
     info!("Database tables initialized");
 
+    info!("Initializing local embedding engine (bge-small-en-v1.5)...");
+    let embeddings = Arc::new(EmbeddingEngine::new().map_err(|e| {
+        DbError::PgVectorCheckFailed(format!("Failed to initialize embedding engine: {e}"))
+    })?);
+    info!("Embedding engine ready");
+
     info!("Connecting to Discord...");
-    discord::run(config, db).await?;
+    discord::run(config, db, embeddings).await?;
 
     Ok(())
 }

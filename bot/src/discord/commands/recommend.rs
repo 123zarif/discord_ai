@@ -1,10 +1,95 @@
 use poise::serenity_prelude as serenity;
-use crate::anilist;
-use crate::discord::commands::anime::autocomplete_anime;
+use crate::anilist::{self, AnimeMedia};
+use crate::cinemeta::{self, CinemetaMedia};
 use crate::discord::commands::anime_ui::{self, COLOR_RECOMMEND};
 use crate::discord::{Context, Error};
 
-/// Recommend anime to friends and track recommendations you've received.
+#[derive(Debug, poise::ChoiceParameter, Clone, Copy, PartialEq, Eq)]
+pub enum UnifiedMediaTypeChoice {
+    #[name = "Anime"]
+    Anime,
+    #[name = "Movie"]
+    Movie,
+    #[name = "TV Series"]
+    Series,
+}
+
+#[allow(dead_code)]
+impl UnifiedMediaTypeChoice {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Anime => "anime",
+            Self::Movie => "movie",
+            Self::Series => "series",
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Anime => "Anime",
+            Self::Movie => "Movie",
+            Self::Series => "TV Series",
+        }
+    }
+}
+
+/// Autocomplete provider supporting Anime, Movies, and TV series in parallel.
+pub async fn autocomplete_recommend_media(
+    ctx: Context<'_>,
+    partial: &str,
+) -> serenity::CreateAutocompleteResponse {
+    let clean = partial.trim();
+    if clean.is_empty() {
+        return serenity::CreateAutocompleteResponse::new().set_choices(vec![]);
+    }
+
+    let http = &ctx.data().http;
+
+    let (anime_res, movies_res, series_res) = tokio::join!(
+        anilist::search_anime(http, clean, 4),
+        cinemeta::search_movies(http, clean, 3),
+        cinemeta::search_series(http, clean, 3),
+    );
+
+    let mut choices = Vec::new();
+
+    if let Ok(anime_list) = anime_res {
+        for a in anime_list {
+            let mut label = format!("[Anime] {}", a.display_label());
+            if label.len() > 100 {
+                label.truncate(97);
+                label.push_str("...");
+            }
+            choices.push(serenity::AutocompleteChoice::new(label, format!("anime:{}", a.id)));
+        }
+    }
+
+    if let Ok(movies) = movies_res {
+        for m in movies {
+            let mut label = format!("[Movie] {}", m.display_label());
+            if label.len() > 100 {
+                label.truncate(97);
+                label.push_str("...");
+            }
+            choices.push(serenity::AutocompleteChoice::new(label, format!("movie:{}", m.id)));
+        }
+    }
+
+    if let Ok(series) = series_res {
+        for s in series {
+            let mut label = format!("[TV] {}", s.display_label());
+            if label.len() > 100 {
+                label.truncate(97);
+                label.push_str("...");
+            }
+            choices.push(serenity::AutocompleteChoice::new(label, format!("series:{}", s.id)));
+        }
+    }
+
+    serenity::CreateAutocompleteResponse::new().set_choices(choices)
+}
+
+/// Recommend anime, movies, or TV series to friends and view recommendations.
 #[poise::command(
     slash_command,
     subcommands("send", "list", "sent"),
@@ -14,15 +99,23 @@ pub async fn recommend(_ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Recommend an anime to another user with an optional personal note.
+enum ResolvedMedia {
+    Anime(AnimeMedia),
+    Movie(CinemetaMedia),
+    Series(CinemetaMedia),
+}
+
+/// Recommend an anime, movie, or TV series to another user with an optional personal note.
 #[poise::command(slash_command)]
 pub async fn send(
     ctx: Context<'_>,
-    #[description = "User you are recommending this anime to"]
+    #[description = "User you are recommending to"]
     user: serenity::User,
-    #[description = "Anime title to recommend"]
-    #[autocomplete = "autocomplete_anime"]
-    anime: String,
+    #[description = "Title to recommend (search anime, movies, and TV series)"]
+    #[autocomplete = "autocomplete_recommend_media"]
+    media: String,
+    #[description = "Media type (optional override if typing title manually)"]
+    media_type: Option<UnifiedMediaTypeChoice>,
     #[description = "Optional note or reason why you recommend it"]
     note: Option<String>,
 ) -> Result<(), Error> {
@@ -35,7 +128,7 @@ pub async fn send(
     if user.id == sender.id {
         ctx.send(
             poise::CreateReply::default()
-                .content("❌ You cannot recommend an anime to yourself! Use `/watchlist add` instead.")
+                .content("You cannot recommend media to yourself! Use `/watchlist add` or `/movielist add` instead.")
                 .ephemeral(true),
         )
         .await?;
@@ -44,19 +137,77 @@ pub async fn send(
 
     let http = &ctx.data().http;
     let db = &ctx.data().db;
+    let input = media.trim();
 
-    let media = if let Ok(id) = anime.trim().parse::<i32>() {
-        anilist::get_anime_by_id(http, id).await.map_err(|e| e.to_string())?
+    // Check if input came from autocomplete (e.g. "anime:16498", "movie:tt1375666", "series:tt0903747")
+    let resolved = if let Some(stripped) = input.strip_prefix("anime:") {
+        if let Ok(id) = stripped.parse::<i32>() {
+            anilist::get_anime_by_id(http, id).await?.map(ResolvedMedia::Anime)
+        } else {
+            None
+        }
+    } else if let Some(imdb_id) = input.strip_prefix("movie:") {
+        cinemeta::get_movie_by_id(http, imdb_id).await?.map(ResolvedMedia::Movie)
+    } else if let Some(imdb_id) = input.strip_prefix("series:") {
+        cinemeta::get_series_by_id(http, imdb_id).await?.map(ResolvedMedia::Series)
+    } else if input.starts_with("tt") && input.chars().skip(2).all(|c| c.is_ascii_digit()) {
+        // Raw IMDb ID without prefix
+        if let Some(m) = cinemeta::get_movie_by_id(http, input).await? {
+            Some(ResolvedMedia::Movie(m))
+        } else if let Some(s) = cinemeta::get_series_by_id(http, input).await? {
+            Some(ResolvedMedia::Series(s))
+        } else {
+            None
+        }
     } else {
-        anilist::get_anime_by_title(http, anime.trim()).await.map_err(|e| e.to_string())?
+        // Plain text search
+        match media_type {
+            Some(UnifiedMediaTypeChoice::Anime) => {
+                anilist::get_anime_by_title(http, input).await?.map(ResolvedMedia::Anime)
+            }
+            Some(UnifiedMediaTypeChoice::Movie) => {
+                let res = cinemeta::search_movies(http, input, 1).await?;
+                if let Some(first) = res.into_iter().next() {
+                    cinemeta::get_movie_by_id(http, &first.id).await?.map(ResolvedMedia::Movie)
+                } else {
+                    None
+                }
+            }
+            Some(UnifiedMediaTypeChoice::Series) => {
+                let res = cinemeta::search_series(http, input, 1).await?;
+                if let Some(first) = res.into_iter().next() {
+                    cinemeta::get_series_by_id(http, &first.id).await?.map(ResolvedMedia::Series)
+                } else {
+                    None
+                }
+            }
+            None => {
+                // Try AniList first, then movie, then series
+                if let Some(a) = anilist::get_anime_by_title(http, input).await? {
+                    Some(ResolvedMedia::Anime(a))
+                } else {
+                    let m_res = cinemeta::search_movies(http, input, 1).await.unwrap_or_default();
+                    if let Some(first) = m_res.into_iter().next() {
+                        cinemeta::get_movie_by_id(http, &first.id).await?.map(ResolvedMedia::Movie)
+                    } else {
+                        let s_res = cinemeta::search_series(http, input, 1).await.unwrap_or_default();
+                        if let Some(first) = s_res.into_iter().next() {
+                            cinemeta::get_series_by_id(http, &first.id).await?.map(ResolvedMedia::Series)
+                        } else {
+                            None
+                        }
+                    }
+                }
+            }
+        }
     };
 
-    let target_anime = match media {
-        Some(a) => a,
+    let target_media = match resolved {
+        Some(m) => m,
         None => {
             ctx.send(
                 poise::CreateReply::default()
-                    .content(format!("❌ Could not find anime `{anime}` on AniList."))
+                    .content(format!("Could not find media matching `{input}`."))
                     .ephemeral(true),
             )
             .await?;
@@ -64,87 +215,168 @@ pub async fn send(
         }
     };
 
-    // Cache anime in DB
-    db.upsert_anime_cache(&target_anime).await?;
+    let (m_type, m_id, title, poster_url, embed, _site_url) = match target_media {
+        ResolvedMedia::Anime(a) => {
+            db.upsert_anime_cache(&a).await?;
+            let site = a.site_url.clone().unwrap_or_else(|| "https://anilist.co".to_string());
+            let poster = a.cover_image.as_ref().and_then(|c| c.best_url().map(|s| s.to_string()));
 
-    // Create recommendation record in DB
+            let mut desc = String::new();
+            if let Some(ref note_text) = note {
+                desc.push_str(&format!("> 💬 *\"{note_text}\"*\n\n"));
+            }
+            let raw_desc = a.clean_description();
+            let (truncated, was_cut) = anime_ui::truncate_synopsis(&raw_desc, 300);
+            desc.push_str(&truncated);
+            if was_cut {
+                desc.push_str(&format!("... [Read more]({site})"));
+            }
+
+            let format_str = anime_ui::clean_format(a.format.as_deref());
+            let status_str = anime_ui::clean_airing_status(a.status.as_deref());
+            let ep_str = a.episodes.map(|ep| format!("**{ep}** eps")).unwrap_or_else(|| "Ongoing".to_string());
+            let score_str = a.average_score.map(|s| format!("⭐ **{s}%**")).unwrap_or_else(|| "—".to_string());
+
+            let mut em = serenity::CreateEmbed::new()
+                .author(serenity::CreateEmbedAuthor::new(format!("Recommended by {sender_name}")).icon_url(sender_avatar.clone()))
+                .title(format!("[Anime] {}", a.display_title()))
+                .url(&site)
+                .description(desc)
+                .color(COLOR_RECOMMEND)
+                .field("Rating", score_str, true)
+                .field("Format", format!("{format_str} • {ep_str} • {status_str}"), true);
+
+            if !a.genres.is_empty() {
+                em = em.field("Genres", a.genres.join(" • "), false);
+            }
+            if let Some(ref p) = poster {
+                em = em.thumbnail(p);
+            }
+            if let Some(ref banner) = a.banner_image {
+                em = em.image(banner);
+            }
+
+            em = em.footer(serenity::CreateEmbedFooter::new("Click below to add to your anime watchlist"));
+            ("anime", a.id.to_string(), a.display_title().to_string(), poster, em, site)
+        }
+        ResolvedMedia::Movie(m) => {
+            db.upsert_media_cache(&m).await?;
+            let site = format!("https://www.imdb.com/title/{}/", m.id());
+            let poster = m.poster.clone();
+
+            let mut desc = String::new();
+            if let Some(ref note_text) = note {
+                desc.push_str(&format!("> 💬 *\"{note_text}\"*\n\n"));
+            }
+            let raw_desc = m.clean_description();
+            let (truncated, was_cut) = anime_ui::truncate_synopsis(&raw_desc, 300);
+            desc.push_str(&truncated);
+            if was_cut {
+                desc.push_str(&format!("... [IMDb]({site})"));
+            }
+
+            let rating_str = m.imdb_rating.as_ref().map(|r| format!("⭐ **{r}/10**")).unwrap_or_else(|| "—".to_string());
+            let runtime_str = m.runtime.as_ref().map(|r| r.as_str()).unwrap_or("—");
+
+            let mut em = serenity::CreateEmbed::new()
+                .author(serenity::CreateEmbedAuthor::new(format!("Recommended by {sender_name}")).icon_url(sender_avatar.clone()))
+                .title(format!("[Movie] {}", m.name))
+                .url(&site)
+                .description(desc)
+                .color(0xE50914) // Movie red
+                .field("IMDb Rating", rating_str, true)
+                .field("Runtime", runtime_str.to_string(), true);
+
+            if !m.genres.is_empty() {
+                em = em.field("Genres", m.genres.join(" • "), false);
+            }
+            if let Some(ref p) = poster {
+                em = em.thumbnail(p);
+            }
+            if let Some(ref banner) = m.background {
+                em = em.image(banner);
+            }
+
+            em = em.footer(serenity::CreateEmbedFooter::new("Click below to add to your movie watchlist"));
+            ("movie", m.id().to_string(), m.name.clone(), poster, em, site)
+        }
+        ResolvedMedia::Series(s) => {
+            db.upsert_media_cache(&s).await?;
+            let site = format!("https://www.imdb.com/title/{}/", s.id());
+            let poster = s.poster.clone();
+
+            let mut desc = String::new();
+            if let Some(ref note_text) = note {
+                desc.push_str(&format!("> 💬 *\"{note_text}\"*\n\n"));
+            }
+            let raw_desc = s.clean_description();
+            let (truncated, was_cut) = anime_ui::truncate_synopsis(&raw_desc, 300);
+            desc.push_str(&truncated);
+            if was_cut {
+                desc.push_str(&format!("... [IMDb]({site})"));
+            }
+
+            let rating_str = s.imdb_rating.as_ref().map(|r| format!("⭐ **{r}/10**")).unwrap_or_else(|| "—".to_string());
+            let status_str = s.status.as_ref().or(s.runtime.as_ref()).map(|st| st.as_str()).unwrap_or("TV Series");
+
+            let mut em = serenity::CreateEmbed::new()
+                .author(serenity::CreateEmbedAuthor::new(format!("Recommended by {sender_name}")).icon_url(sender_avatar.clone()))
+                .title(format!("[TV Series] {}", s.name))
+                .url(&site)
+                .description(desc)
+                .color(0x00A8E8) // TV Cyan
+                .field("IMDb Rating", rating_str, true)
+                .field("Status", status_str.to_string(), true);
+
+            if !s.genres.is_empty() {
+                em = em.field("Genres", s.genres.join(" • "), false);
+            }
+            if let Some(ref p) = poster {
+                em = em.thumbnail(p);
+            }
+            if let Some(ref banner) = s.background {
+                em = em.image(banner);
+            }
+
+            em = em.footer(serenity::CreateEmbedFooter::new("Click below to add to your TV watchlist"));
+            ("series", s.id().to_string(), s.name.clone(), poster, em, site)
+        }
+    };
+
+    // Store unified recommendation in database
     let rec_id = db
-        .create_recommendation(
+        .create_unified_recommendation(
             sender.id.get(),
             user.id.get(),
-            target_anime.id,
+            m_type,
+            &m_id,
+            &title,
+            poster_url.as_deref(),
             note.as_deref(),
         )
         .await?;
 
-    let site_url = target_anime.site_url.as_deref().unwrap_or("https://anilist.co");
-
-    // Compose modern recommendation description
-    let mut desc = String::new();
-    if let Some(ref note_text) = note {
-        desc.push_str(&format!("> 💬 *\"{note_text}\"*\n\n"));
-    }
-
-    let raw_desc = target_anime.clean_description();
-    let (truncated, was_cut) = anime_ui::truncate_synopsis(&raw_desc, 300);
-    desc.push_str(&truncated);
-    if was_cut {
-        desc.push_str(&format!("... [Read more]({site_url})"));
-    }
-
-    let format_str = anime_ui::clean_format(target_anime.format.as_deref());
-    let status_str = anime_ui::clean_airing_status(target_anime.status.as_deref());
-
-    let mut embed = serenity::CreateEmbed::new()
-        .author(
-            serenity::CreateEmbedAuthor::new(format!("Recommended by {sender_name}"))
-                .icon_url(sender_avatar),
-        )
-        .title(target_anime.display_title())
-        .url(site_url)
-        .description(desc)
-        .color(COLOR_RECOMMEND);
-
-    // Cover thumbnail and banner
-    if let Some(ref cover) = target_anime.cover_image {
-        if let Some(img_url) = cover.best_url() {
-            embed = embed.thumbnail(img_url);
+    // Also insert into legacy anime recommendations if anime for backwards compatibility
+    if m_type == "anime" {
+        if let Ok(anime_id) = m_id.parse::<i32>() {
+            let _ = db.create_recommendation(sender.id.get(), user.id.get(), anime_id, note.as_deref()).await;
         }
     }
 
-    if let Some(ref banner) = target_anime.banner_image {
-        embed = embed.image(banner);
-    }
-
-    // Metadata fields
-    let score_str = target_anime
-        .average_score
-        .map(|s| format!("⭐ **{s}%**"))
-        .unwrap_or_else(|| "—".to_string());
-    let ep_str = target_anime
-        .episodes
-        .map(|ep| format!("**{ep}** eps"))
-        .unwrap_or_else(|| "Ongoing".to_string());
-
-    embed = embed.field("Rating", score_str, true);
-    embed = embed.field("Format", format!("{format_str} • {ep_str} • {status_str}"), true);
-
-    if !target_anime.genres.is_empty() {
-        embed = embed.field("Genres", target_anime.genres.join(" • "), false);
-    }
-
-    embed = embed.footer(serenity::CreateEmbedFooter::new(
-        "Click below to add this recommendation to your watchlist",
-    ));
-
     // Interactive Button for recipient
-    let button_id = format!("anime:rec_add:{}:{}:{}", rec_id, user.id.get(), target_anime.id);
+    let button_id = format!("rec_add:{}:{}:{}:{}", rec_id, user.id.get(), m_type, m_id);
     let add_button = serenity::CreateButton::new(button_id)
         .label("Add to Watchlist")
         .style(serenity::ButtonStyle::Primary);
 
     let action_row = serenity::CreateActionRow::Buttons(vec![add_button]);
-    let message_text = format!("<@{}>, **{}** recommended an anime for you!", user.id, sender_name);
+    let type_label = match m_type {
+        "anime" => "an anime",
+        "movie" => "a movie",
+        "series" => "a TV series",
+        _ => "a title",
+    };
+    let message_text = format!("<@{}>, **{}** recommended {type_label} for you!", user.id, sender_name);
 
     ctx.send(
         poise::CreateReply::default()
@@ -157,7 +389,7 @@ pub async fn send(
     Ok(())
 }
 
-/// View anime recommendations you have received from other users.
+/// View recommendations you have received from other users.
 #[poise::command(slash_command)]
 pub async fn list(
     ctx: Context<'_>,
@@ -170,7 +402,7 @@ pub async fn list(
     let recipient_id = ctx.author().id.get();
     let sender_filter = from.as_ref().map(|u| u.id.get());
 
-    let recs = db.get_received_recommendations(recipient_id, sender_filter).await?;
+    let recs = db.get_received_unified_recommendations(recipient_id, sender_filter).await?;
 
     let caller = ctx.author();
     let caller_name = caller.global_name.as_deref().unwrap_or(&caller.name);
@@ -179,7 +411,7 @@ pub async fn list(
     if recs.is_empty() {
         let msg = match from {
             Some(u) => format!("You haven't received any recommendations from **{}**.", u.name),
-            None => "You haven't received any anime recommendations yet!\nFriends can send you one with `/recommend send`.".to_string(),
+            None => "You haven't received any recommendations yet!\nFriends can send you one with `/recommend send`.".to_string(),
         };
         let embed = serenity::CreateEmbed::new()
             .author(serenity::CreateEmbedAuthor::new(format!("{caller_name}'s Recommendations")).icon_url(caller_avatar))
@@ -199,13 +431,18 @@ pub async fn list(
 
     for (idx, rec) in recs.iter().take(12).enumerate() {
         let status_badge = if rec.status == "added" {
-            "✅ `Added to Watchlist`"
+            "`Added to Watchlist`"
         } else {
-            "⏳ `Pending`"
+            "`Pending`"
         };
-        let site_url = rec.site_url.as_deref().unwrap_or("https://anilist.co");
 
-        let title_line = format!("`{:2}` [**{}**]({})\n", idx + 1, rec.display_title(), site_url);
+        let (type_tag, site_url) = match rec.media_type.as_str() {
+            "anime" => ("Anime", format!("https://anilist.co/anime/{}", rec.media_id)),
+            "movie" | "series" => (if rec.media_type == "series" { "TV" } else { "Movie" }, format!("https://www.imdb.com/title/{}/", rec.media_id)),
+            _ => ("Media", "#".to_string()),
+        };
+
+        let title_line = format!("`{:2}` `[{type_tag}]` [**{}**]({})\n", idx + 1, rec.title, site_url);
         let meta_line = format!("      From <@{}> • {}\n", rec.sender_id, status_badge);
 
         description.push_str(&title_line);
@@ -227,8 +464,8 @@ pub async fn list(
         .description(description)
         .color(COLOR_RECOMMEND);
 
-    if let Some(cover) = recs.first().and_then(|r| r.cover_url.as_deref()) {
-        embed = embed.thumbnail(cover);
+    if let Some(poster) = recs.first().and_then(|r| r.poster_url.as_deref()) {
+        embed = embed.thumbnail(poster);
     }
 
     embed = embed.footer(serenity::CreateEmbedFooter::new(format!(
@@ -239,7 +476,7 @@ pub async fn list(
     Ok(())
 }
 
-/// View anime recommendations you have sent to other users.
+/// View recommendations you have sent to other users.
 #[poise::command(slash_command)]
 pub async fn sent(ctx: Context<'_>) -> Result<(), Error> {
     ctx.defer().await?;
@@ -247,7 +484,7 @@ pub async fn sent(ctx: Context<'_>) -> Result<(), Error> {
     let db = &ctx.data().db;
     let sender_id = ctx.author().id.get();
 
-    let recs = db.get_sent_recommendations(sender_id).await?;
+    let recs = db.get_sent_unified_recommendations(sender_id).await?;
 
     let caller = ctx.author();
     let caller_name = caller.global_name.as_deref().unwrap_or(&caller.name);
@@ -256,7 +493,7 @@ pub async fn sent(ctx: Context<'_>) -> Result<(), Error> {
     if recs.is_empty() {
         let embed = serenity::CreateEmbed::new()
             .author(serenity::CreateEmbedAuthor::new(format!("{caller_name}'s Sent Recommendations")).icon_url(caller_avatar))
-            .description("You haven't sent any recommendations yet!\nUse `/recommend send` to recommend anime to a friend.")
+            .description("You haven't sent any recommendations yet!\nUse `/recommend send` to recommend anime, movies, or TV series to a friend.")
             .color(0xF39C12);
         ctx.send(poise::CreateReply::default().embed(embed)).await?;
         return Ok(());
@@ -267,13 +504,18 @@ pub async fn sent(ctx: Context<'_>) -> Result<(), Error> {
 
     for (idx, rec) in recs.iter().take(12).enumerate() {
         let status_badge = if rec.status == "added" {
-            "✅ `Added`"
+            "`Added`"
         } else {
-            "⏳ `Pending`"
+            "`Pending`"
         };
-        let site_url = rec.site_url.as_deref().unwrap_or("https://anilist.co");
 
-        let title_line = format!("`{:2}` [**{}**]({})\n", idx + 1, rec.display_title(), site_url);
+        let (type_tag, site_url) = match rec.media_type.as_str() {
+            "anime" => ("Anime", format!("https://anilist.co/anime/{}", rec.media_id)),
+            "movie" | "series" => (if rec.media_type == "series" { "TV" } else { "Movie" }, format!("https://www.imdb.com/title/{}/", rec.media_id)),
+            _ => ("Media", "#".to_string()),
+        };
+
+        let title_line = format!("`{:2}` `[{type_tag}]` [**{}**]({})\n", idx + 1, rec.title, site_url);
         let meta_line = format!("      Sent to <@{}> • {}\n", rec.recipient_id, status_badge);
 
         description.push_str(&title_line);
@@ -291,12 +533,12 @@ pub async fn sent(ctx: Context<'_>) -> Result<(), Error> {
 
     let mut embed = serenity::CreateEmbed::new()
         .author(serenity::CreateEmbedAuthor::new(format!("{caller_name}'s Recommendations")).icon_url(caller_avatar))
-        .title("Sent Anime Recommendations")
+        .title("Sent Recommendations")
         .description(description)
         .color(0xF39C12);
 
-    if let Some(cover) = recs.first().and_then(|r| r.cover_url.as_deref()) {
-        embed = embed.thumbnail(cover);
+    if let Some(poster) = recs.first().and_then(|r| r.poster_url.as_deref()) {
+        embed = embed.thumbnail(poster);
     }
 
     embed = embed.footer(serenity::CreateEmbedFooter::new(format!(

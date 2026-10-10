@@ -5,10 +5,15 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::db::Database;
 use crate::discord::{commands, events, AppData, Error};
+use crate::embeddings::EmbeddingEngine;
 use crate::error::AppError;
 
 /// Builds and starts the Discord bot client with Poise framework and Serenity.
-pub async fn run(config: Arc<Config>, db: Database) -> Result<(), AppError> {
+pub async fn run(
+    config: Arc<Config>,
+    db: Database,
+    embeddings: Arc<EmbeddingEngine>,
+) -> Result<(), AppError> {
     let framework_options = poise::FrameworkOptions {
         commands: commands::all(),
         event_handler: |framework, event| {
@@ -42,6 +47,7 @@ pub async fn run(config: Arc<Config>, db: Database) -> Result<(), AppError> {
     let config_for_webhook = config.clone();
     let db_for_app = db.clone();
     let db_for_webhook = db.clone();
+    let embeddings_for_app = embeddings.clone();
 
     let framework = poise::Framework::builder()
         .options(framework_options)
@@ -84,6 +90,7 @@ pub async fn run(config: Arc<Config>, db: Database) -> Result<(), AppError> {
                     config: config_for_app,
                     db: db_for_app,
                     http,
+                    embeddings: embeddings_for_app,
                 })
             })
         })

@@ -1,13 +1,52 @@
-# Rust build artifacts
+# Rust build artifacts & caches
 target/
+**/target/
 **/*.rs.bk
+*.pdb
+*.rlib
 
-# Environment and secrets
+# ML Model Caches (FastEmbed / ONNX / HuggingFace)
+.fastembed_cache/
+**/.fastembed_cache/
+huggingface/
+**/.cache/
+
+# Environment files and credentials
 .env
+.env.*
+!.env.example
 *.env.local
+*.pem
+*.key
+*.cert
+*.crt
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
 
-# Database local storage (if mapped locally)
+# Database local storage & dumps
 postgres_data/
+**/postgres_data/
+*.dump
+*.sql.gz
+
+# Media downloads & temporary storage
+downloads/
+temp/
+tmp/
+*.mp4
+*.mp3
+*.mov
+*.avi
+*.webm
+
+# Log files
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
 # OS and Editor files
 .DS_Store
@@ -16,3 +55,6 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+*~
+.cursor/
+.claude/

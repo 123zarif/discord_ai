@@ -2,15 +2,21 @@ pub mod actions;
 pub mod anime;
 pub mod health;
 pub mod instagram;
+pub mod media;
+pub mod messages;
 
+use std::collections::HashSet;
 use std::time::Duration;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use crate::anilist::AnimeMedia;
+use crate::cinemeta::CinemetaMedia;
 use crate::error::{DbError, Result};
 pub use anime::{RecommendationDetailedEntry, WatchlistDetailedEntry};
 pub use health::DatabaseHealthReport;
 pub use instagram::InstagramSender;
+pub use media::{MediaWatchlistDetailedEntry, UnifiedRecommendationEntry, UnifiedWatchlistEntry};
+pub use messages::NewDiscordMessage;
 
 #[derive(Clone)]
 pub struct Database {
@@ -48,6 +54,8 @@ impl Database {
         actions::init_tables(&self.pool).await?;
         anime::init_tables(&self.pool).await?;
         instagram::init_tables(&self.pool).await?;
+        messages::init_tables(&self.pool).await?;
+        media::init_tables(&self.pool).await?;
         Ok(())
     }
 
@@ -192,4 +200,118 @@ impl Database {
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         instagram::set_setting(&self.pool, key, value).await.map_err(Into::into)
     }
+
+    /// Retrieves existing message IDs from a given list of snowflake IDs.
+    pub async fn get_existing_message_ids(&self, message_ids: &[u64]) -> Result<HashSet<u64>> {
+        messages::get_existing_message_ids(&self.pool, message_ids).await
+    }
+
+    /// Inserts a batch of new Discord messages into PostgreSQL with vector embeddings.
+    pub async fn batch_insert_messages(&self, messages: &[NewDiscordMessage]) -> Result<usize> {
+        messages::batch_insert_messages(&self.pool, messages).await
+    }
+
+    /// Counts total messages stored for a specific channel.
+    pub async fn count_channel_messages(&self, channel_id: u64) -> Result<i64> {
+        messages::count_channel_messages(&self.pool, channel_id).await
+    }
+
+    /// Counts messages stored for a channel sent by the target user.
+    pub async fn count_target_user_messages(&self, channel_id: u64) -> Result<i64> {
+        messages::count_target_user_messages(&self.pool, channel_id).await
+    }
+
+    /// Returns the oldest message snowflake ID stored in the database for a channel.
+    pub async fn get_oldest_message_id(&self, channel_id: u64) -> Result<Option<u64>> {
+        messages::get_oldest_message_id(&self.pool, channel_id).await
+    }
+
+    /// Caches movie or series metadata.
+    pub async fn upsert_media_cache(&self, media: &CinemetaMedia) -> Result<()> {
+        media::upsert_media_cache(&self.pool, media).await
+    }
+
+    /// Adds or updates a user's movie & series watchlist entry.
+    pub async fn upsert_media_watchlist_entry(
+        &self,
+        user_id: u64,
+        imdb_id: &str,
+        status: &str,
+        progress: Option<i32>,
+        score: Option<i32>,
+    ) -> Result<()> {
+        media::upsert_media_watchlist_entry(&self.pool, user_id, imdb_id, status, progress, score).await
+    }
+
+    /// Retrieves a user's movie & series watchlist entries.
+    pub async fn get_user_media_watchlist(
+        &self,
+        user_id: u64,
+        type_filter: Option<&str>,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<MediaWatchlistDetailedEntry>> {
+        media::get_user_media_watchlist(&self.pool, user_id, type_filter, status_filter).await
+    }
+
+    /// Retrieves a unified list of watchlist entries across Anime, Movies, and TV series.
+    pub async fn get_unified_watchlist(
+        &self,
+        user_id: u64,
+        type_filter: Option<&str>,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<UnifiedWatchlistEntry>> {
+        media::get_unified_watchlist(&self.pool, user_id, type_filter, status_filter).await
+    }
+
+    /// Removes a movie or series from a user's watchlist.
+    pub async fn remove_from_media_watchlist(&self, user_id: u64, imdb_id: &str) -> Result<bool> {
+        media::remove_from_media_watchlist(&self.pool, user_id, imdb_id).await
+    }
+
+    /// Creates a unified peer recommendation.
+    pub async fn create_unified_recommendation(
+        &self,
+        sender_id: u64,
+        recipient_id: u64,
+        media_type: &str,
+        media_id: &str,
+        title: &str,
+        poster_url: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<i64> {
+        media::create_unified_recommendation(
+            &self.pool,
+            sender_id,
+            recipient_id,
+            media_type,
+            media_id,
+            title,
+            poster_url,
+            note,
+        )
+        .await
+    }
+
+    /// Retrieves received unified recommendations for a recipient.
+    pub async fn get_received_unified_recommendations(
+        &self,
+        recipient_id: u64,
+        sender_filter: Option<u64>,
+    ) -> Result<Vec<UnifiedRecommendationEntry>> {
+        media::get_received_unified_recommendations(&self.pool, recipient_id, sender_filter).await
+    }
+
+    /// Retrieves sent unified recommendations from a sender.
+    pub async fn get_sent_unified_recommendations(
+        &self,
+        sender_id: u64,
+    ) -> Result<Vec<UnifiedRecommendationEntry>> {
+        media::get_sent_unified_recommendations(&self.pool, sender_id).await
+    }
+
+    /// Updates the status of a unified recommendation.
+    pub async fn mark_unified_recommendation_status(&self, rec_id: i64, status: &str) -> Result<()> {
+        media::mark_unified_recommendation_status(&self.pool, rec_id, status).await
+    }
 }
+

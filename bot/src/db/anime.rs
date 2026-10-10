@@ -44,6 +44,7 @@ pub struct WatchlistDetailedEntry {
     pub episodes: Option<i32>,
     pub average_score: Option<i32>,
     pub site_url: Option<String>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl WatchlistDetailedEntry {
@@ -260,7 +261,8 @@ pub async fn get_user_watchlist(
             c.cover_url,
             c.episodes,
             c.average_score,
-            c.site_url
+            c.site_url,
+            w.updated_at
         FROM user_anime_watchlist w
         JOIN anime_cache c ON w.anime_id = c.id
         WHERE w.user_id = $1
