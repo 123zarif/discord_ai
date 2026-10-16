@@ -11,6 +11,7 @@ pub mod movielist;
 pub mod ping;
 pub mod recommend;
 pub mod status;
+pub mod syncplay;
 pub mod tv;
 pub mod watchlist;
 
@@ -31,6 +32,7 @@ pub fn all() -> Vec<poise::Command<AppData, Error>> {
         movie::movie(),
         tv::tv(),
         movielist::movielist(),
+        syncplay::syncplay(),
         instagram::instagram(),
     ];
     cmds.extend(individual_actions::all_action_commands());

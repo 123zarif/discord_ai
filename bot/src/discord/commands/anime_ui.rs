@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use poise::serenity_prelude as serenity;
 
 pub const COLOR_ANILIST: u32 = 0x3DB4F2;

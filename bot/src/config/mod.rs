@@ -13,6 +13,11 @@ pub struct Config {
     pub instagram_verify_token: String,
     pub instagram_webhook_port: u16,
     pub instagram_target_channel_id: Option<u64>,
+    pub syncplay_host: String,
+    pub syncplay_default_room: String,
+    pub syncplay_password: Option<String>,
+    pub syncplay_bot_name: String,
+    pub syncplay_channel_id: Option<u64>,
 }
 
 impl Config {
@@ -114,6 +119,12 @@ impl Config {
             .ok()
             .and_then(|id| id.parse::<u64>().ok());
 
+        let syncplay_host = std::env::var("SYNCPLAY_HOST").unwrap_or_else(|_| "127.0.0.1:8999".to_string());
+        let syncplay_default_room = std::env::var("SYNCPLAY_ROOM").unwrap_or_else(|_| "cinema".to_string());
+        let syncplay_password = std::env::var("SYNCPLAY_PASSWORD").ok().filter(|s| !s.trim().is_empty());
+        let syncplay_bot_name = std::env::var("SYNCPLAY_BOT_NAME").unwrap_or_else(|_| "DiscordBridge".to_string());
+        let syncplay_channel_id = std::env::var("SYNCPLAY_CHANNEL_ID").ok().and_then(|id| id.parse::<u64>().ok());
+
         Ok(Self {
             discord_token,
             database_url,
@@ -124,6 +135,11 @@ impl Config {
             instagram_verify_token,
             instagram_webhook_port,
             instagram_target_channel_id,
+            syncplay_host,
+            syncplay_default_room,
+            syncplay_password,
+            syncplay_bot_name,
+            syncplay_channel_id,
         })
     }
 
@@ -151,6 +167,11 @@ impl fmt::Debug for Config {
             .field("instagram_verify_token", &"[REDACTED]")
             .field("instagram_webhook_port", &self.instagram_webhook_port)
             .field("instagram_target_channel_id", &self.instagram_target_channel_id)
+            .field("syncplay_host", &self.syncplay_host)
+            .field("syncplay_default_room", &self.syncplay_default_room)
+            .field("syncplay_password", &"[REDACTED]")
+            .field("syncplay_bot_name", &self.syncplay_bot_name)
+            .field("syncplay_channel_id", &self.syncplay_channel_id)
             .finish()
     }
 }
@@ -171,18 +192,28 @@ mod tests {
             instagram_verify_token: "super_secret_verify_token".to_string(),
             instagram_webhook_port: 3000,
             instagram_target_channel_id: Some(12345),
+            syncplay_host: "127.0.0.1:8999".to_string(),
+            syncplay_default_room: "cinema".to_string(),
+            syncplay_password: Some("secret_sync_pass".to_string()),
+            syncplay_bot_name: "DiscordBridge".to_string(),
+            syncplay_channel_id: Some(987654),
         };
 
         let debug_str = format!("{config:?}");
         assert!(!debug_str.contains("super_secret_discord_token"));
         assert!(!debug_str.contains("postgresql://user:pass"));
         assert!(!debug_str.contains("super_secret_verify_token"));
+        assert!(!debug_str.contains("secret_sync_pass"));
         assert!(debug_str.contains("[REDACTED]"));
         assert!(debug_str.contains("111222333"));
         assert!(debug_str.contains("444555666"));
         assert!(debug_str.contains("777888999"));
         assert!(debug_str.contains("3000"));
         assert!(debug_str.contains("12345"));
+        assert!(debug_str.contains("127.0.0.1:8999"));
+        assert!(debug_str.contains("cinema"));
+        assert!(debug_str.contains("DiscordBridge"));
+        assert!(debug_str.contains("987654"));
     }
 
     #[test]
@@ -197,6 +228,11 @@ mod tests {
             instagram_verify_token: "dummy".to_string(),
             instagram_webhook_port: 3000,
             instagram_target_channel_id: None,
+            syncplay_host: "127.0.0.1:8999".to_string(),
+            syncplay_default_room: "cinema".to_string(),
+            syncplay_password: None,
+            syncplay_bot_name: "DiscordBridge".to_string(),
+            syncplay_channel_id: None,
         };
 
         assert!(config.is_owner(UserId::new(100)));

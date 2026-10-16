@@ -19,13 +19,27 @@ pub async fn handle_event(
             );
         }
         serenity::FullEvent::Message { new_message } => {
-            // Ignore bot accounts to prevent message feedback loops
-            if new_message.author.bot {
+            // Ignore bot accounts and webhooks to prevent message feedback loops
+            if new_message.author.bot || new_message.webhook_id.is_some() {
                 return Ok(());
             }
 
-            // Hook for future message ingestion pipeline:
-            // At this foundation stage, we avoid storing messages prematurely.
+            // Syncplay chat relay: check if this message is in the bound Syncplay channel
+            let data = framework.user_data().await;
+            if let Some(bound_channel) = data.syncplay.get_bound_channel_id() {
+                if new_message.channel_id.get() == bound_channel {
+                    let author_name = new_message
+                        .author
+                        .global_name
+                        .as_deref()
+                        .unwrap_or(&new_message.author.name);
+
+                    if let Err(e) = data.syncplay.send_discord_chat(author_name, &new_message.content).await {
+                        tracing::warn!("Failed to relay Discord message to Syncplay: {e}");
+                    }
+                }
+            }
+
             trace!(
                 "Message received from user {} in channel {}: length {}",
                 new_message.author.id,

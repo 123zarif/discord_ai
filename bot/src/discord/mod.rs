@@ -16,6 +16,7 @@ pub struct AppData {
     pub db: Database,
     pub http: reqwest::Client,
     pub embeddings: Arc<EmbeddingEngine>,
+    pub syncplay: Arc<crate::syncplay::SyncplayBridgeHandle>,
 }
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

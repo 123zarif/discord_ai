@@ -37,6 +37,9 @@ services:
       - POSTGRES_PORT=${POSTGRES_PORT:-5432}
       # Ensure database host points to the postgres container in Docker network
       - DATABASE_URL=${DATABASE_URL:-postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-discord_ai}}
+      - SYNCPLAY_HOST=${SYNCPLAY_HOST:-host.docker.internal:8999}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "${INSTAGRAM_WEBHOOK_PORT:-3000}:3000"
     depends_on:

@@ -86,11 +86,27 @@ pub async fn run(
                     .build()
                     .unwrap_or_default();
 
+                let syncplay_config = crate::syncplay::SyncplayClientConfig {
+                    host: config_for_app.syncplay_host.clone(),
+                    username: config_for_app.syncplay_bot_name.clone(),
+                    room: config_for_app.syncplay_default_room.clone(),
+                    password: config_for_app.syncplay_password.clone(),
+                };
+
+                let syncplay_bridge = crate::syncplay::start_syncplay_bridge(
+                    syncplay_config,
+                    config_for_app.syncplay_channel_id,
+                    db_for_app.clone(),
+                    ctx.http.clone(),
+                )
+                .await;
+
                 Ok(AppData {
                     config: config_for_app,
                     db: db_for_app,
                     http,
                     embeddings: embeddings_for_app,
+                    syncplay: Arc::new(syncplay_bridge),
                 })
             })
         })

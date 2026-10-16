@@ -6,6 +6,7 @@ mod discord;
 pub mod embeddings;
 mod error;
 pub mod instagram;
+pub mod syncplay;
 
 use std::sync::Arc;
 use tracing::{error, info};
