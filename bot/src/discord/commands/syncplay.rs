@@ -83,8 +83,19 @@ pub async fn status(ctx: Context<'_>) -> Result<(), Error> {
         None => "*None (use `/syncplay bind`)*".to_string(),
     };
 
+    let rooms_str = if status.active_rooms.is_empty() {
+        format!("`#{}`", status.active_room)
+    } else {
+        status
+            .active_rooms
+            .iter()
+            .map(|r| format!("`#{r}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
     let users_str = if status.active_users.is_empty() {
-        "*No other users in room*".to_string()
+        "*No active users detected*".to_string()
     } else {
         status.active_users.join(", ")
     };
@@ -97,12 +108,13 @@ pub async fn status(ctx: Context<'_>) -> Result<(), Error> {
         .color(if status.is_connected { COLOR_SYNCPLAY } else { 0xE74C3C })
         .field("Connection", conn_str, true)
         .field("Server Host", format!("`{}`", status.host), true)
-        .field("Active Room", format!("`{}`", status.active_room), true)
+        .field("Primary Room", format!("`#{}`", status.active_room), true)
         .field("Bound Discord Channel", bound_str, true)
+        .field("Active Rooms", rooms_str, true)
         .field("Playback State", format!("{play_str} • `{file_str}`"), false)
         .field("Active Viewers", users_str, false)
         .footer(serenity::CreateEmbedFooter::new(
-            "Use /syncplay bind to switch channels or /syncplay room to switch rooms",
+            "Use /syncplay bind to switch channels or /syncplay room to switch primary room",
         ));
 
     ctx.send(poise::CreateReply::default().embed(embed)).await?;

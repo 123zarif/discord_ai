@@ -151,29 +151,29 @@ async fn run_bridge_event_processor(
         let channel = serenity::ChannelId::new(channel_snowflake);
 
         match event {
-            BridgeEvent::Chat { username, message } => {
-                if let Err(e) = relay_chat_to_discord(&http, channel, &username, &message).await {
+            BridgeEvent::Chat { username, room, message } => {
+                if let Err(e) = relay_chat_to_discord(&http, channel, &username, &room, &message).await {
                     error!("Failed to relay Syncplay chat to Discord channel {channel_snowflake}: {e:?}");
                 }
             }
             BridgeEvent::UserJoined { username, room } => {
-                let msg = format!("👋 **{username}** joined the room `{room}`.");
+                let msg = format!("👋 **{username}** joined room `#{room}`.");
                 let _ = channel.say(&http, msg).await;
             }
             BridgeEvent::UserLeft { username, room } => {
-                let msg = format!("🚪 **{username}** left the room `{room}`.");
+                let msg = format!("🚪 **{username}** left room `#{room}`.");
                 let _ = channel.say(&http, msg).await;
             }
-            BridgeEvent::FileLoaded { username, filename, duration } => {
+            BridgeEvent::FileLoaded { username, room, filename, duration } => {
                 let dur_str = format_duration(duration);
                 let msg = if duration > 0.0 {
-                    format!("🎬 **{username}** loaded file: `{filename}` ({dur_str})")
+                    format!("🎬 **{username}** in `#{room}` loaded file: `{filename}` ({dur_str})")
                 } else {
-                    format!("🎬 **{username}** loaded file: `{filename}`")
+                    format!("🎬 **{username}** in `#{room}` loaded file: `{filename}`")
                 };
                 let _ = channel.say(&http, msg).await;
             }
-            BridgeEvent::PlaystateChanged { paused, position, set_by } => {
+            BridgeEvent::PlaystateChanged { room, paused, position, set_by } => {
                 let mut last = last_playstate_notify.lock().await;
                 // Throttling: ignore rapid consecutive playstate notifications (max 1 per 5s)
                 if last.elapsed() < Duration::from_secs(5) {
@@ -183,9 +183,9 @@ async fn run_bridge_event_processor(
 
                 let time_str = format_duration(position);
                 let msg = if paused {
-                    format!("⏸️ **{set_by}** paused at `{time_str}`.")
+                    format!("⏸️ **{set_by}** paused in `#{room}` at `{time_str}`.")
                 } else {
-                    format!("▶️ **{set_by}** resumed at `{time_str}`.")
+                    format!("▶️ **{set_by}** resumed in `#{room}` at `{time_str}`.")
                 };
                 let _ = channel.say(&http, msg).await;
             }
@@ -204,6 +204,7 @@ async fn relay_chat_to_discord(
     http: &serenity::Http,
     channel_id: serenity::ChannelId,
     username: &str,
+    room: &str,
     message: &str,
 ) -> anyhow::Result<()> {
     // Attempt webhook execution for native avatar and username display
@@ -225,7 +226,7 @@ async fn relay_chat_to_discord(
                     http,
                     false,
                     serenity::ExecuteWebhook::new()
-                        .username(format!("{username} (Syncplay)"))
+                        .username(format!("{username} (Syncplay - #{room})"))
                         .avatar_url(avatar)
                         .content(message),
                 )
@@ -239,7 +240,7 @@ async fn relay_chat_to_discord(
 
     // Fallback: Post standard bot message
     channel_id
-        .say(http, format!("**[{username}]**: {message}"))
+        .say(http, format!("**[{username} in #{room}]**: {message}"))
         .await?;
 
     Ok(())

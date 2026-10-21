@@ -127,6 +127,10 @@ pub enum SyncplayPacket {
         #[serde(rename = "Set")]
         set: serde_json::Value,
     },
+    ListWrapper {
+        #[serde(rename = "List")]
+        list: serde_json::Value,
+    },
     StateWrapper {
         #[serde(rename = "State")]
         state: StatePayload,
@@ -144,6 +148,7 @@ pub enum BridgeEvent {
     },
     Chat {
         username: String,
+        room: String,
         message: String,
     },
     UserJoined {
@@ -156,10 +161,12 @@ pub enum BridgeEvent {
     },
     FileLoaded {
         username: String,
+        room: String,
         filename: String,
         duration: f64,
     },
     PlaystateChanged {
+        room: String,
         paused: bool,
         position: f64,
         set_by: String,
@@ -197,6 +204,18 @@ mod tests {
                 assert_eq!(ping.latencyCalculation, Some(12345.67));
             }
             _ => panic!("Expected StateWrapper"),
+        }
+    }
+
+    #[test]
+    fn test_parse_list_packet() {
+        let raw = r#"{"List": {"cinema": {"Alice": {"file": {"name": "movie.mkv"}}}}}"#;
+        let packet: SyncplayPacket = serde_json::from_str(raw).expect("should parse list packet");
+        match packet {
+            SyncplayPacket::ListWrapper { list } => {
+                assert!(list.get("cinema").is_some());
+            }
+            _ => panic!("Expected ListWrapper"),
         }
     }
 }
